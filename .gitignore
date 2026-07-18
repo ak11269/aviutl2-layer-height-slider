@@ -1,0 +1,15 @@
+# ビルド生成物
+*.obj
+*.lib
+*.exp
+*.dll
+*.aux2
+*.pdb
+*.ilk
+
+# Visual Studio
+.vs/
+x64/
+Debug/
+Release/
+*.vcxproj.user
