@@ -13,10 +13,12 @@
 //	  汎用プラグイン API の restart_host_app() で本体を再起動することで
 //	  反映します (style.conf は起動時のみ読み込まれます)。
 //
-//	style.conf の検索優先順位 (存在するファイルを編集します):
+//	style.conf の検索優先順位 (「自動」選択時。存在するファイルを編集します):
 //	  1. %ProgramData%\aviutl2\style.conf          (SHGetKnownFolderPathで取得)
 //	  2. <AviUtl2.exeのあるフォルダ>\Data\style.conf
 //	  3. <AviUtl2.exeのあるフォルダ>\style.conf
+//	  ※編集対象はコンボボックスから手動選択も出来ます。選択はプラグインと
+//	    同じフォルダの LayerHeightSlider.ini に保存され、再起動後も維持されます。
 //	  ※書き換えるのは LayerHeight の値のみで、他の行・コメント・改行コードは
 //	    バイト単位でそのまま保持します。
 //
@@ -66,6 +68,7 @@
 #define IDC_PRESET_MEDIUM	1003	// プリセット「中」ボタン
 #define IDC_PRESET_LARGE	1004	// プリセット「大」ボタン
 #define IDC_APPLY			1005	// 「適用して再起動」ボタン
+#define IDC_CONF_TARGET		1006	// 編集対象style.conf選択コンボボックス
 
 // レイヤー高さの可変範囲 (ピクセル)
 // 小さすぎるとレイヤー名やオブジェクトが描画出来なくなる為に下限を設けています
@@ -97,6 +100,9 @@ static HWND		g_btn_small     = nullptr;	// プリセットボタン
 static HWND		g_btn_medium    = nullptr;
 static HWND		g_btn_large     = nullptr;
 static HWND		g_btn_apply     = nullptr;	// 適用ボタン
+static HWND		g_combo_conf    = nullptr;	// 編集対象style.conf選択コンボボックス
+
+static HINSTANCE g_hinst        = nullptr;	// 本プラグインDLLのインスタンスハンドル (DllMainで設定)
 
 static HFONT	g_font          = nullptr;	// 本体設定に合わせたフォント
 static HBRUSH	g_brush_bg      = nullptr;	// 本体設定に合わせた背景ブラシ
@@ -159,12 +165,48 @@ static std::wstring GetHostExeDir() {
 	return path.substr(0, sep);	// ファイル名部分を除去してフォルダパスにする
 }
 
-// 編集対象の style.conf のパスを優先順位に従って決定します
+// 編集対象の選択モード (コンボボックスの項目の並び順と一致させます)
+constexpr int CONF_MODE_AUTO        = 0;	// 自動 (優先順位で選択)
+constexpr int CONF_MODE_PROGRAMDATA = 1;	// %ProgramData%\aviutl2\style.conf
+constexpr int CONF_MODE_DATA        = 2;	// <AviUtl2.exeのフォルダ>\Data\style.conf
+constexpr int CONF_MODE_EXE         = 3;	// <AviUtl2.exeのフォルダ>\style.conf
+
+static int g_conf_mode = CONF_MODE_AUTO;	// 現在の編集対象モード (iniに保存されます)
+
+// 指定モードの style.conf のパスを返します (CONF_MODE_AUTOは対象外)
+// パスが取得出来ない場合は空文字を返します
+static std::wstring GetCandidatePath(int mode) {
+	switch (mode) {
+	case CONF_MODE_PROGRAMDATA: {
+		const std::wstring pd = GetProgramDataDir();
+		return pd.empty() ? std::wstring() : pd + L"\\aviutl2\\style.conf";
+	}
+	case CONF_MODE_DATA: {
+		const std::wstring exe = GetHostExeDir();
+		return exe.empty() ? std::wstring() : exe + L"\\Data\\style.conf";
+	}
+	case CONF_MODE_EXE: {
+		const std::wstring exe = GetHostExeDir();
+		return exe.empty() ? std::wstring() : exe + L"\\style.conf";
+	}
+	}
+	return L"";
+}
+
+// 編集対象の style.conf のパスを決定します
+// 手動選択されている場合はそのパスを、自動の場合は優先順位に従って決定します
 //   1. %ProgramData%\aviutl2\style.conf          (存在する場合)
 //   2. <AviUtl2.exeのフォルダ>\Data\style.conf   (存在する場合)
 //   3. <AviUtl2.exeのフォルダ>\style.conf        (最終フォールバック)
 // 取得に失敗した場合は空文字を返します
 static std::wstring FindStyleConfPath() {
+	// 手動選択されている場合はそのパスをそのまま返す
+	if (g_conf_mode != CONF_MODE_AUTO) {
+		const std::wstring manual = GetCandidatePath(g_conf_mode);
+		if (!manual.empty()) return manual;
+		// パスが取得出来なかった場合は自動選択にフォールバックする
+	}
+
 	// 優先順位1: ProgramData 版
 	const std::wstring program_data = GetProgramDataDir();
 	std::wstring pd_conf;
@@ -185,6 +227,45 @@ static std::wstring FindStyleConfPath() {
 
 	// exeフォルダが取得出来なかった場合の保険 (通常は到達しません)
 	return pd_conf;
+}
+
+//----------------------------------------------------------------------------------
+//	プラグイン設定 (編集対象の選択) の保存・読み込み
+//----------------------------------------------------------------------------------
+
+// プラグイン設定ファイルのパスを返します
+// プラグインDLLと同じフォルダの LayerHeightSlider.ini になります
+// (通常は C:\ProgramData\aviutl2\Plugin\LayerHeightSlider.ini)
+static std::wstring GetSettingsIniPath() {
+	wchar_t buf[1024];
+	const DWORD n = GetModuleFileNameW(g_hinst, buf, 1024);
+	if (n == 0 || n >= 1024) return L"";
+	std::wstring path(buf, n);
+	// 拡張子(.aux2)を .ini に差し替える
+	const size_t dot = path.find_last_of(L'.');
+	const size_t sep = path.find_last_of(L'\\');
+	if (dot == std::wstring::npos || (sep != std::wstring::npos && dot < sep)) {
+		return path + L".ini";
+	}
+	return path.substr(0, dot) + L".ini";
+}
+
+// 編集対象モードを ini から読み込みます (未設定・不正値の場合は自動選択)
+static void LoadConfMode() {
+	const std::wstring ini = GetSettingsIniPath();
+	if (ini.empty()) return;
+	int mode = (int)GetPrivateProfileIntW(L"Settings", L"ConfTarget", CONF_MODE_AUTO, ini.c_str());
+	if (mode < CONF_MODE_AUTO || mode > CONF_MODE_EXE) mode = CONF_MODE_AUTO;
+	g_conf_mode = mode;
+}
+
+// 編集対象モードを ini に保存します (AviUtl2を再起動しても選択が維持されます)
+static void SaveConfMode() {
+	const std::wstring ini = GetSettingsIniPath();
+	if (ini.empty()) return;
+	wchar_t val[16];
+	wsprintfW(val, L"%d", g_conf_mode);
+	WritePrivateProfileStringW(L"Settings", L"ConfTarget", val, ini.c_str());
 }
 
 //----------------------------------------------------------------------------------
@@ -374,6 +455,11 @@ static void UpdatePathLabel() {
 	std::wstring text = g_config->translate(g_config, L"編集対象");
 	text += L": ";
 	text += path.empty() ? g_config->translate(g_config, L"(取得失敗)") : path;
+	// 対象ファイルが未作成の場合は分かるように表示する (次回保存時に作成されます)
+	if (!path.empty() && !FileExistsW(path)) {
+		text += L" ";
+		text += g_config->translate(g_config, L"(未作成)");
+	}
 	SetWindowTextW(g_label_path, text.c_str());
 }
 
@@ -421,11 +507,16 @@ static void LayoutControls(int client_width) {
 	MoveWindow(g_btn_apply, margin, y, w, item_h + 6, TRUE);
 	y += item_h + 12;
 
-	// 5行目: 編集対象の style.conf パス (幅が足りない場合は中央を「...」で省略表示)
+	// 5行目: 編集対象の style.conf 選択コンボボックス
+	// ※高さにはドロップダウン展開時のリスト分を含めて指定します (表示部の高さは自動)
+	MoveWindow(g_combo_conf, margin, y, w, item_h * 8, TRUE);
+	y += item_h + 10;
+
+	// 6行目: 編集対象の style.conf パス (幅が足りない場合は中央を「...」で省略表示)
 	MoveWindow(g_label_path, margin, y, w, item_h, TRUE);
 	y += item_h + 4;
 
-	// 6行目: 注意書き
+	// 7行目: 注意書き
 	MoveWindow(g_label_note, margin, y, w, item_h * 2, TRUE);
 }
 
@@ -489,6 +580,41 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
 				}
 			}
 			return 0;
+		case IDC_CONF_TARGET:
+			// 編集対象 style.conf の選択変更
+			if (HIWORD(wparam) == CBN_SELCHANGE) {
+				const int sel = (int)SendMessageW(g_combo_conf, CB_GETCURSEL, 0, 0);
+				if (sel >= CONF_MODE_AUTO && sel <= CONF_MODE_EXE && sel != g_conf_mode) {
+					bool accept = true;
+					// 手動選択したファイルが未作成の場合は新規作成して良いか確認する
+					// (優先順位の高い場所に最小限のファイルを新規作成すると、優先順位の
+					//  低い場所にある既存のstyle.confが読み込まれなくなる恐れがある為)
+					if (sel != CONF_MODE_AUTO) {
+						const std::wstring path = GetCandidatePath(sel);
+						if (!path.empty() && !FileExistsW(path)) {
+							std::wstring msg = path + L"\r\n\r\n";
+							msg += g_config->translate(g_config,
+								L"選択したstyle.confはまだ存在しません。次回の保存時に新規作成されます。\r\n"
+								L"※新規作成されるファイルにはLayerHeightのみが記述されます。\r\n"
+								L"　優先順位の高い場所に新規作成すると、優先順位の低い場所にある\r\n"
+								L"　既存のstyle.confの設定が使われなくなる場合があります。\r\n\r\n"
+								L"このファイルを編集対象にしますか？");
+							accept = (MessageBoxW(hwnd, msg.c_str(), PLUGIN_WINDOW_NAME,
+								MB_OKCANCEL | MB_ICONWARNING) == IDOK);
+						}
+					}
+					if (accept) {
+						g_conf_mode = sel;
+						SaveConfMode();	// 選択をiniに保存 (再起動後も維持されます)
+					} else {
+						// キャンセル時は選択表示を元に戻す
+						SendMessageW(g_combo_conf, CB_SETCURSEL, g_conf_mode, 0);
+					}
+					UpdatePathLabel();	// 表示パスを新しい対象に更新
+				}
+				SetFocus(NULL);	// フォーカスを外して本体のショートカットキーを妨げない
+			}
+			return 0;
 		}
 		break;
 
@@ -516,7 +642,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
 
 static COMMON_PLUGIN_TABLE common_plugin_table = {
 	L"レイヤー高さ設定",											// プラグインの名前
-	L"Layer Height Slider version 1.2.0 (style.confのLayerHeightをGUIから変更します)",	// プラグインの情報
+	L"Layer Height Slider version 1.3.0 (style.confのLayerHeightをGUIから変更します)",	// プラグインの情報
 };
 
 //----------------------------------------------------------------------------------
@@ -562,6 +688,9 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 	// トラックバーコントロールを使う為に Common Controls を初期化
 	INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
 	InitCommonControlsEx(&icc);
+
+	// 前回選択した編集対象モードを ini から復元する
+	LoadConfMode();
 
 	//------------------------------------------------------------------
 	// 本体のテーマ (style.conf) から配色・フォントを取得してUIに馴染ませる
@@ -661,6 +790,20 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 		WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
 		0, 0, 0, 0, g_hwnd, (HMENU)IDC_APPLY, GetModuleHandleW(0), nullptr);
 
+	// 編集対象の style.conf 選択コンボボックス
+	// CBS_DROPDOWNLIST: リストからの選択のみ(直接入力不可)
+	g_combo_conf = CreateWindowExW(
+		0, WC_COMBOBOXW, L"",
+		WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+		0, 0, 0, 0, g_hwnd, (HMENU)IDC_CONF_TARGET, GetModuleHandleW(0), nullptr);
+	// 項目の並び順は CONF_MODE_* の値と一致させること
+	SendMessageW(g_combo_conf, CB_ADDSTRING, 0,
+		(LPARAM)g_config->translate(g_config, L"自動 (優先順位で選択)"));
+	SendMessageW(g_combo_conf, CB_ADDSTRING, 0, (LPARAM)L"ProgramData\\aviutl2\\style.conf");
+	SendMessageW(g_combo_conf, CB_ADDSTRING, 0, (LPARAM)L"AviUtl2フォルダ\\Data\\style.conf");
+	SendMessageW(g_combo_conf, CB_ADDSTRING, 0, (LPARAM)L"AviUtl2フォルダ\\style.conf");
+	SendMessageW(g_combo_conf, CB_SETCURSEL, g_conf_mode, 0);
+
 	// 編集対象の style.conf パス表示ラベル
 	// SS_PATHELLIPSIS: 幅に収まらないパスを「C:\...\style.conf」の形で省略表示
 	g_label_path = CreateWindowExW(
@@ -678,7 +821,7 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 	// 全コントロールに本体テーマのフォントを適用
 	const HWND controls[] = {
 		g_label_value, g_trackbar, g_btn_small, g_btn_medium,
-		g_btn_large, g_btn_apply, g_label_path, g_label_note,
+		g_btn_large, g_btn_apply, g_combo_conf, g_label_path, g_label_note,
 	};
 	for (HWND c : controls) {
 		SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
@@ -705,6 +848,8 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
 	switch (reason) {
 	case DLL_PROCESS_ATTACH:
+		// 設定ファイル(ini)のパス取得に使う為、自身のインスタンスハンドルを保持
+		g_hinst = (HINSTANCE)hModule;
 		// スレッド毎の DLL_THREAD_ATTACH/DETACH 通知は不要なので無効化 (軽量化)
 		DisableThreadLibraryCalls(hModule);
 		break;
